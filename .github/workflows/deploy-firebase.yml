@@ -1,0 +1,113 @@
+name: Deploy to Firebase Hosting
+
+# Dispatched by Convex (convex/deployments.ts::deployToFirebase, stage
+# FIREBASE_DEPLOY) after validate-candidate.yml succeeds. Convex commits
+# .env.production (VITE_SITE_ID/VITE_CONVEX_URL for this tenant) to
+# `targetBranch` immediately before dispatching, so the commit this run
+# resolves to (github.sha) is one commit ahead of `inputs.commit_sha` —
+# that's expected here, unlike validate-repository.yml/validate-candidate.yml.
+# Convex polls this workflow's run status/conclusion on a fixed interval,
+# then independently verifies the live URL itself
+# (convex/deployments.ts::reconcileFirebaseDeployment) — the callback below
+# is a best-effort nudge only; a missing/failed callback never blocks the
+# pipeline, since polling remains authoritative. This workflow does not
+# smoke-test itself; Convex does that independently after the callback (or
+# next poll) fires.
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Validated commit SHA from validate-candidate.yml (informational)
+        required: true
+        type: string
+      artifact_checksum:
+        description: Checksum of the validated build artifact from validate-candidate.yml (informational)
+        required: true
+        type: string
+      firebase_project_id:
+        description: Shared Firebase project ID
+        required: true
+        type: string
+      firebase_site_id:
+        description: This project's Firebase Hosting site ID
+        required: true
+        type: string
+      site_id:
+        description: BuildPilot tenant/site ID for the shared Convex backend
+        required: true
+        type: string
+      correlation_id:
+        description: BuildPilot correlation ID for tracing
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Log validated build reference
+        run: |
+          echo "Validated commit ${{ inputs.commit_sha }} (artifact checksum ${{ inputs.artifact_checksum }}), correlation ${{ inputs.correlation_id }}"
+          echo "Deploying branch HEAD ${{ github.sha }}, which includes the tenant .env.production commit"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Target this project's Firebase Hosting site
+        run: |
+          jq --arg site "${{ inputs.firebase_site_id }}" '.hosting.site = $site' firebase.json > firebase.json.tmp
+          mv firebase.json.tmp firebase.json
+
+      - name: Authenticate to Firebase
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      # Firebase Hosting sites are not auto-created by `firebase deploy` —
+      # each generated customer site needs its own Hosting site
+      # (firebase_site_id) provisioned once before the first deploy can
+      # succeed ("could not find site ... for project ..." otherwise).
+      # Convex derives a unique site ID per project but has no direct
+      # Firebase credentials of its own (only this workflow, via the
+      # service account above, does), so provisioning happens here.
+      - name: Ensure Firebase Hosting site exists
+        run: |
+          if npx --yes firebase-tools@15 hosting:sites:list --project "${{ inputs.firebase_project_id }}" --json \
+              | jq -e --arg site "${{ inputs.firebase_site_id }}" '.result.sites[]? | select(.name | endswith("/sites/" + $site))' > /dev/null; then
+            echo "Firebase Hosting site ${{ inputs.firebase_site_id }} already exists"
+          else
+            npx --yes firebase-tools@15 hosting:sites:create "${{ inputs.firebase_site_id }}" --project "${{ inputs.firebase_project_id }}"
+          fi
+
+      - name: Deploy to Firebase Hosting
+        run: npx --yes firebase-tools@15 deploy --only hosting --project "${{ inputs.firebase_project_id }}" --non-interactive
+
+      - name: Notify Convex (best-effort)
+        if: always()
+        run: |
+          if [ -z "${{ vars.CONVEX_CALLBACK_URL }}" ]; then
+            echo "CONVEX_CALLBACK_URL is not configured; Convex will still detect this run via polling."
+            exit 0
+          fi
+          curl -sf -X POST "${{ vars.CONVEX_CALLBACK_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.CONVEX_CALLBACK_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflow\":\"deploy-firebase\",\"commit_sha\":\"${{ inputs.commit_sha }}\",\"correlation_id\":\"${{ inputs.correlation_id }}\",\"conclusion\":\"${{ job.status }}\"}" \
+            || echo "::warning::Convex callback failed; Convex will still detect this run via polling."

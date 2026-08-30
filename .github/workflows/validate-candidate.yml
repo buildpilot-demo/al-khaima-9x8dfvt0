@@ -1,0 +1,75 @@
+name: Validate candidate build
+
+# Dispatched by Convex (convex/devin.ts::reconcileDevinStatus, stage
+# CANDIDATE_VALIDATION) once Devin pushes a completed build to the target
+# branch (initial build or a revision). Convex polls this workflow's run
+# status/conclusion on a fixed interval, then reads the uploaded artifact's
+# checksum via the GitHub Actions artifacts API
+# (convex/devin.ts::reconcileCandidateValidation) — the callback below is a
+# best-effort nudge only; a missing/failed callback never blocks the
+# pipeline, since polling remains authoritative.
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact commit SHA to validate (Devin's push, or a revision commit)
+        required: true
+        type: string
+      correlation_id:
+        description: BuildPilot correlation ID for tracing
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    name: npm ci && npm run build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify dispatch targets the expected commit
+        run: |
+          if [ "${{ github.sha }}" != "${{ inputs.commit_sha }}" ]; then
+            echo "::error::Resolved commit ${{ github.sha }} does not match requested commit ${{ inputs.commit_sha }} (correlation ${{ inputs.correlation_id }})"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Notify Convex (best-effort)
+        if: always()
+        run: |
+          if [ -z "${{ vars.CONVEX_CALLBACK_URL }}" ]; then
+            echo "CONVEX_CALLBACK_URL is not configured; Convex will still detect this run via polling."
+            exit 0
+          fi
+          curl -sf -X POST "${{ vars.CONVEX_CALLBACK_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.CONVEX_CALLBACK_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflow\":\"validate-candidate\",\"commit_sha\":\"${{ inputs.commit_sha }}\",\"correlation_id\":\"${{ inputs.correlation_id }}\",\"conclusion\":\"${{ job.status }}\"}" \
+            || echo "::warning::Convex callback failed; Convex will still detect this run via polling."
