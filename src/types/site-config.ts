@@ -101,6 +101,8 @@ export type SiteProductsSection = {
   heading: string;
   body: string;
   scrollHeightVh: number;
+  /** Aspect ratio every product image card is rendered at, e.g. "1:1". */
+  imageAspectRatio?: string;
   items: SiteProductItem[];
 };
 

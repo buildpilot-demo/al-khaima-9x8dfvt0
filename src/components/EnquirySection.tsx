@@ -1,6 +1,14 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import { useMutation } from "convex/react";
+import { makeFunctionReference } from "convex/server";
 import { siteConfig } from "../site.config";
+import { siteId } from "../lib/convex";
 import { EnquiryForm } from "./EnquiryForm";
+
+// Submission mutation on BuildPilot's shared, multi-tenant Convex
+// deployment (see convex/README.md): defined and deployed outside this
+// repository, so it is referenced by function path rather than imported.
+const submitInquiry = makeFunctionReference<"mutation">("siteSubmissions:submitInquiry");
 
 // Shared across both the cinematic and plain site variants (see
 // src/types/site-config.ts) — enquirySection, businessName, and contact all
@@ -8,6 +16,21 @@ import { EnquiryForm } from "./EnquiryForm";
 export function EnquirySection() {
   const { enquirySection, businessName, contact } = siteConfig;
   const sectionRef = useRef<HTMLDivElement>(null);
+  const sendInquiry = useMutation(submitInquiry);
+
+  const handleSubmit = useCallback(
+    async (values: { name: string; email: string; phone: string; enquiryType: string; message: string }) => {
+      // Without a tenant id there is nothing to scope the write to, so stay
+      // honest instead of pretending the enquiry was delivered.
+      if (!siteId) throw new Error(enquirySection.disconnectedMessage);
+      try {
+        await sendInquiry({ siteId, ...values });
+      } catch {
+        throw new Error(enquirySection.disconnectedMessage);
+      }
+    },
+    [enquirySection.disconnectedMessage, sendInquiry],
+  );
 
   useEffect(() => {
     const element = sectionRef.current;
@@ -34,7 +57,7 @@ export function EnquirySection() {
           {contact.hours && <p className="muted">{contact.hours}</p>}
         </div>
         <div className="enquiry-form">
-          <EnquiryForm />
+          <EnquiryForm onSubmit={handleSubmit} />
         </div>
       </div>
       <footer className="site-footer">
